@@ -26,7 +26,7 @@ module Amazon
     def set_default_values
       self.skipped    = !new_record?
       self.new_order  = new_record?
-      self.line_items = {}
+    ##  self.line_items = {}
     end
 
     def skipped? ; @skipped ; end
@@ -34,11 +34,16 @@ module Amazon
     def new_order? ; @new_order ; end
 
     def set_amounts_from_line_items
+      line_items = {}
       line_items.each_pair { |key, amount| self.send "#{key}=", amount if self.respond_to?("#{key}=") }
     end
 
     def set_new_order
       self.new_order = true
+    end
+
+    def set_slack
+	self.sent_to_slack = true
     end
 
     def set_completion

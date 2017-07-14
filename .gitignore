@@ -1,4 +1,5 @@
 .DS_Store
 config/account.yml
+config/slack.yml
 db/orders.sqlite3
 test/data

@@ -27,6 +27,63 @@ task console: :environment do
 end
 
 desc 'display some interesting stats about your order history'
+task get_latests: :environment do
+  include ActiveSupport::NumberHelper
+  include ActionView::Helpers::DateHelper
+  include Amazon
+
+  begin
+      slack = YAML.load_file('./config/slack.yml').with_indifferent_access
+      slack['url']
+  rescue 
+      puts "\nHmm... no Slack URL found.\n".red
+      Rake::Task['slack_config:generate'].execute
+      retry
+  end
+  date_time = Time.now
+  puts "Starting sending to Slack: #{date_time} "  
+  i = 0
+  Order.all.each do |order, hsh|
+	if order.sent_to_slack
+	  next
+	end
+	begin
+		total = "$#{order.line_items['grand_total']}"
+		date = order.date.strftime("%B %d, %Y")
+		message =  "Amazon.com Order Number: #{order.id} Placed: #{date} Total: #{total}"
+		json = {text: message}.to_json
+	rescue Exception => e 
+	  puts "Order ##{order.order_id.green} skipped because of #{e.message}"
+	  order.set_slack
+	  order.save!
+	  next
+	end
+
+	## Posting to slack:
+	uri = URI(slack['url'])
+	http = Net::HTTP.new(uri.host, uri.port)
+	http.use_ssl = true
+	http.verify_mode = OpenSSL::SSL::VERIFY_NONE
+	req = Net::HTTP::Post.new(uri.to_s)
+	req['Content-Type'] = 'application/json'
+	req['User-Agent'] = 'Mac Safari'
+	req.body = json
+	print "sending Order ##{order.order_id.green}   to slack ... "
+	res = http.request(req)
+	if res.body == "ok"
+	  puts "response #{res.body}"
+	  order.set_slack
+	  order.save!
+	  i = i + 1
+	else
+	  puts "response failed"
+	  puts "#{res.body.dump}"
+	end
+  end
+  puts "Sent #{i} orders"
+
+end
+
 task stats: :environment do
   include ActiveSupport::NumberHelper
   include ActionView::Helpers::DateHelper
@@ -118,6 +175,24 @@ namespace :config do
   end
 end
 
+namespace :slack_config do
+  desc 'generate a config/slack.yml file with your Slack POST url'
+  task generate: :dependencies do
+    puts "Slack URL will be stored in:\n#{File.expand_path('./config/slack.yml').to_s.red}\n\n"
+
+    slack_url = ask 'Enter Slack URL: '
+    puts "\n"
+
+    if slack_url.blank? 
+      puts "No luck with that; please try again.\n\n"
+      next
+    end
+
+    File.open('./config/slack.yml', 'w') { |f| f.puts({ url: slack_url }.to_yaml) }
+    puts "Wrote values to #{File.expand_path('./config/slack.yml').to_s}\n\n"
+  end
+end
+
 namespace :db do
   desc 'wipe all local order data'
   task reset: :establish_connection do
@@ -140,6 +215,7 @@ namespace :db do
 
           t.boolean :gift, default: false, null: false
           t.boolean :completed, default: false, null: false
+          t.boolean :sent_to_slack, default: false, null: false
           t.text :line_items
           t.timestamps null: false
         end
@@ -165,6 +241,8 @@ namespace :orders do
 
   desc 'log in to amazon and fetch all orders'
   task fetch: :environment do
+    date_time = Time.now
+    puts "Starting fetching from Amazon: #{date_time} "  
     begin
       puts "Loading account settings ..."
       account = YAML.load_file('./config/account.yml').with_indifferent_access
@@ -179,13 +257,18 @@ namespace :orders do
     puts "Loading #{'Amazon.com'.yellow}..."
     agent.get('https://www.amazon.com/') do |page|
       puts "Loading the login page.."
-      login_page = agent.click(page.link_with(href: %r{ap/signin}))
+      login_page = agent.click(page.link_with( :text => 'Hello. Sign inAccount & ListsSign inAccount & Lists'   ))
       puts "Filling out the form and logging in..."
       begin
         post_login_page = login_page.form_with(action: %r{ap/signin}) do |f|
           account.each_pair { |k,v| f.send "#{k}=", v }
         end.click_button
-        orders_page = agent.click(post_login_page.link_with(text: 'Your Orders'))
+	#post_login_page.links.each do |link| 
+	#	puts "#{link.text} href: #{link.href}"
+	#end
+	link = "https://www.amazon.com/gp/css/order-history/ref=nav_youraccount_bnav_ya_ad_orders"
+	orders_page = agent.get(link)
+        #orders_page = agent.click(post_login_page.link_with(text: 'Your Orders'))
       rescue NoMethodError
         puts "\nLogging in to Amazon.com failed.\n".red
         puts "Try running #{'rake config:generate'.yellow} and updating your credentials."
@@ -200,10 +283,12 @@ namespace :orders do
         Rake::Task['db:migrate'].execute
       end
 
+      cancelled_page = agent.click(orders_page.link_with(  href: %r{oh_aui_menu_cancelled} ))
+
+      ## New orders
       years = orders_page.search('form#timePeriodForm select[name=orderFilter] option[value^="year-"]').map do |option_tag|
         option_tag.content.strip.to_i
       end
-
       years.each do |year|
         puts "Looking up orders from #{year.to_s.blue}..."
         orders_page = orders_page.form_with(id: 'timePeriodForm') do |f|
@@ -230,8 +315,35 @@ namespace :orders do
             page += 1
           end
         end
-
       end
+
+
+
+#	puts "Finished for current orders"
+#	## cancelled orders
+#	page = 0
+#	puts "Looking up for cancelled orders ..."
+#	catch :no_more_orders do	
+#	  loop do
+#            cancelled_page.search('#ordersContainer > .order').each do |node|
+#   	      order = Amazon::OrderImporter.import(node, agent)
+#              action = order.skipped? ? 'skipped' : nil
+#              ( action = order.new_order? ? 'imported' : 'updated' ) if action.nil?
+#              puts "    #{action.titleize.yellow} Order ##{order.order_id.green} (#{order.reload.shipments.count} shipments)" 
+#	    end
+#	    begin
+#              last_pagination_element = cancelled_page.search('ul.a-pagination li.a-last')[0]
+#              link = last_pagination_element.css('a')[0]
+#            rescue NoMethodError
+#              throw :no_more_orders
+#            end
+#	    throw :no_more_orders unless link
+#            cancelled_page  = agent.click(link)
+#            page += 1
+#          end 
+#	end
+	
+
 
       puts "\nYippee! All done."
     end
